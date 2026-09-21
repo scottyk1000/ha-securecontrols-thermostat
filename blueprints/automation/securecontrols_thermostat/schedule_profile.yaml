@@ -1,0 +1,68 @@
+blueprint:
+  name: Secure Controls - switch schedule profile
+  description: >-
+    Writes one of two weekly schedules to a Secure Controls zone whenever an on/off entity
+    changes. Use it for "working from home", "holiday", school terms or a winter/summer
+    switch. The trigger can be a toggle helper, a presence group or a calendar (on while
+    an event is running).
+
+
+    The schedule is stored on the programmer itself, so it keeps running even if Home
+    Assistant or the internet is down. Tip: use the Get schedule action on the zone's
+    calendar to get the current week in the right format, then edit it.
+  domain: automation
+  source_url: https://github.com/andydean565/ha-securecontrols-thermostat/blob/main/blueprints/automation/securecontrols_thermostat/schedule_profile.yaml
+  input:
+    switch_entity:
+      name: Switch
+      description: When this is on, the "on" schedule is used; otherwise the "off" schedule.
+      selector:
+        entity:
+          domain:
+            - input_boolean
+            - binary_sensor
+            - calendar
+            - switch
+            - schedule
+    zone_calendar:
+      name: Zone
+      description: The zone's schedule calendar (e.g. calendar.downstairs_schedule).
+      selector:
+        entity:
+          integration: securecontrols_thermostat
+          domain: calendar
+    schedule_on:
+      name: Schedule when on
+      description: >-
+        Days mapped to periods, e.g.
+        {"weekdays": [{"start": "07:00", "temperature": 20}, {"start": "22:30", "temperature": 15}]}.
+        Days you leave out are not changed.
+      selector:
+        object:
+    schedule_off:
+      name: Schedule when off
+      description: Same format; written when the switch turns off.
+      selector:
+        object:
+
+mode: queued
+max: 3
+
+trigger:
+  - platform: state
+    entity_id: !input switch_entity
+    to:
+      - "on"
+      - "off"
+    for:
+      seconds: 30
+
+action:
+  - variables:
+      schedule_on: !input schedule_on
+      schedule_off: !input schedule_off
+  - service: securecontrols_thermostat.set_schedule
+    target:
+      entity_id: !input zone_calendar
+    data:
+      schedule: "{{ schedule_on if trigger.to_state.state == 'on' else schedule_off }}"

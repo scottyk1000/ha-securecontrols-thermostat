@@ -1,0 +1,82 @@
+blueprint:
+  name: Secure Controls - pause heating while a window is open
+  description: >-
+    Turns a zone down while any of its windows or doors has been open for a while, then
+    puts it back on its schedule when they are all shut again. Nothing on the programmer's
+    schedule changes; if the window is still open at the next scheduled change, the
+    programmer's own schedule takes over.
+  domain: automation
+  source_url: https://github.com/andydean565/ha-securecontrols-thermostat/blob/main/blueprints/automation/securecontrols_thermostat/open_window.yaml
+  input:
+    windows:
+      name: Windows / doors
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+    climate_entity:
+      name: Zone
+      selector:
+        entity:
+          integration: securecontrols_thermostat
+          domain: climate
+    open_delay:
+      name: Open for at least
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: min
+    setback_temperature:
+      name: Temperature while open
+      default: 7
+      selector:
+        number:
+          min: 5
+          max: 20
+          step: 0.5
+          unit_of_measurement: °C
+
+mode: restart
+
+variables:
+  windows: !input windows
+  climate_entity: !input climate_entity
+
+trigger:
+  - platform: state
+    entity_id: !input windows
+    to: "on"
+    for:
+      minutes: !input open_delay
+    id: opened
+  - platform: state
+    entity_id: !input windows
+    to: "off"
+    id: closed
+
+action:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: opened
+        sequence:
+          - service: climate.set_temperature
+            target:
+              entity_id: !input climate_entity
+            data:
+              temperature: !input setback_temperature
+      - conditions:
+          - condition: trigger
+            id: closed
+          - condition: template
+            value_template: "{{ windows | select('is_state', 'on') | list | count == 0 }}"
+          - condition: template
+            value_template: "{{ state_attr(climate_entity, 'scheduled_temperature') is number }}"
+        sequence:
+          - service: climate.set_temperature
+            target:
+              entity_id: !input climate_entity
+            data:
+              temperature: "{{ state_attr(climate_entity, 'scheduled_temperature') }}"

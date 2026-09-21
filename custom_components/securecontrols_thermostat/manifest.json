@@ -1,7 +1,7 @@
 {
   "domain": "securecontrols_thermostat",
   "name": "Secure Controls Thermostat",
-  "version": "0.1.0",
+  "version": "0.4.1",
   "config_flow": true,
   "integration_type": "hub",
   "iot_class": "cloud_polling",
@@ -14,10 +14,17 @@
   ],
   "platforms": [
     "climate",
-    "sensor"
+    "sensor",
+    "switch",
+    "binary_sensor",
+    "calendar"
   ],
   "requirements": [],
   "loggers": [
     "custom_components.securecontrols_thermostat"
+  ],
+  "after_dependencies": [
+    "frontend",
+    "http"
   ]
 }

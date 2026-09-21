@@ -1,0 +1,67 @@
+blueprint:
+  name: Secure Controls - away mode when nobody is home
+  description: >-
+    Puts the heating into the programmer's Away mode once everyone has left, and back to
+    Home when the first person returns. Away uses the programmer's own away setting, so
+    the frost protection temperature still applies.
+  domain: automation
+  source_url: https://github.com/andydean565/ha-securecontrols-thermostat/blob/main/blueprints/automation/securecontrols_thermostat/away_when_empty.yaml
+  input:
+    people:
+      name: People
+      description: Everyone whose presence should count.
+      selector:
+        entity:
+          domain: person
+          multiple: true
+    climate_entity:
+      name: Zone with Away/Home
+      description: The heating zone that shows the Away/Home preset (normally zone 1).
+      selector:
+        entity:
+          integration: securecontrols_thermostat
+          domain: climate
+    leave_delay:
+      name: Wait after everyone leaves
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 240
+          unit_of_measurement: min
+
+mode: restart
+
+variables:
+  people: !input people
+
+trigger:
+  - platform: state
+    entity_id: !input people
+    to: ~  # state changes only, not location/attribute updates
+
+action:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ people | select('is_state', 'home') | list | count == 0 }}"
+        sequence:
+          - delay:
+              minutes: !input leave_delay
+          - condition: template
+            value_template: "{{ people | select('is_state', 'home') | list | count == 0 }}"
+          - service: climate.set_preset_mode
+            target:
+              entity_id: !input climate_entity
+            data:
+              preset_mode: away
+    default:
+      - condition: state
+        entity_id: !input climate_entity
+        attribute: preset_mode
+        state: away
+      - service: climate.set_preset_mode
+        target:
+          entity_id: !input climate_entity
+        data:
+          preset_mode: home

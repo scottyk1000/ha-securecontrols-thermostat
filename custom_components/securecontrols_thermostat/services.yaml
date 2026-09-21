@@ -1,1 +1,75 @@
-# Placeholder for future services (e.g., set_schedule)
+boost:
+  name: Boost hot water
+  description: Boost a Secure Controls hot water channel for a number of minutes.
+  target:
+    entity:
+      integration: securecontrols_thermostat
+      domain: switch
+  fields:
+    minutes:
+      name: Minutes
+      description: How long to boost for.
+      required: true
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 240
+          unit_of_measurement: min
+
+get_schedule:
+  name: Get schedule
+  description: >-
+    Read a zone's weekly schedule from the programmer. The result can be edited and
+    passed straight back to set_schedule.
+  target:
+    entity:
+      integration: securecontrols_thermostat
+      domain: calendar
+
+set_schedule:
+  name: Set schedule
+  description: >-
+    Change a zone's weekly schedule on the programmer. Only the days you give are changed.
+    Heating periods take a temperature (5-30 °C, 0.5 steps); hot water periods take
+    state on/off. Up to 6 periods per day; each runs until the next one starts.
+  target:
+    entity:
+      integration: securecontrols_thermostat
+      domain: calendar
+  fields:
+    schedule:
+      name: Schedule
+      description: >-
+        Days (monday..sunday, weekdays, weekend, all) mapped to their periods.
+        Use this or days + periods.
+      example: >-
+        {"weekdays": [{"start": "06:30", "temperature": 20}, {"start": "08:30", "temperature": 16},
+        {"start": "17:30", "temperature": 20.5}, {"start": "22:30", "temperature": 15}],
+        "weekend": [{"start": "08:00", "temperature": 20}, {"start": "23:00", "temperature": 15}]}
+      selector:
+        object:
+    days:
+      name: Days
+      description: Days to change (used with periods).
+      example: '["weekdays"]'
+      selector:
+        select:
+          multiple: true
+          options:
+            - weekdays
+            - weekend
+            - all
+            - monday
+            - tuesday
+            - wednesday
+            - thursday
+            - friday
+            - saturday
+            - sunday
+    periods:
+      name: Periods
+      description: The periods for those days, in time order.
+      example: '[{"start": "06:30", "temperature": 20}, {"start": "22:30", "temperature": 15}]'
+      selector:
+        object:

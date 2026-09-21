@@ -25,6 +25,16 @@ Json = dict[str, Any]
 WS_URL = "wss://app.beanbag.online/api/TransactionRestAPI/ConnectWebSocket"
 WS_SUBPROTOCOL = "BB-BO-01"
 WS_RESPONSE_TIMEOUT_SECS = 15
+# Schedule writes are relayed to the programmer; allow a little longer than other requests.
+PROGRAM_WRITE_TIMEOUT_SECS = 60
+# Programmers (H3747 confirmed) silently drop requests larger than ~1 KB. A weekly schedule
+# is 898 bytes as compact JSON but 1083 bytes with json.dumps' default ", " / ": "
+# separators, so every request is sent compact, exactly like the official app.
+MAX_REQUEST_BYTES = 1024
+
+
+def _compact_dumps(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"))
 PASSWORD_DIGEST_LENGTH = 32
 HTTP_OK = 200
 HTTP_SERVER_ERROR = 500
@@ -45,6 +55,12 @@ ITEM_HUMID = 8  # %RH
 ITEM_NEXT_TIME = 9  # next schedule time (mins)
 ITEM_NEXT_TARGET = 10  # next scheduled target temp (deci °C)
 ITEM_FROST = 11  # frost_c (deci °C)
+
+# Hot water channel (H3747 / C1727): block SI:16, slot = channel number
+HOT_WATER_SI = 16
+ITEM_HW_BOOST = 4  # V=1 while boosting; OT:2 with D=<minutes> starts, D=0 cancels
+ITEM_HW_NEXT_TIME = 9  # next change / boost end (minutes since local midnight)
+ITEM_HW_NEXT_STATE = 10  # state after the next change (0=off, 1=on)
 
 
 # ---- Thermostat metadata (gateway == device) ----
@@ -152,6 +168,10 @@ class SecureControlsClient:
 
         # Device (gateway == thermostat)
         self.thermostat: Thermostat | None = None
+        # Every gateway on the account (raw GD entries) and, optionally, the
+        # one the config entry was created for.
+        self.gateways: list[dict[str, Any]] = []
+        self.preferred_gmi: str | None = None
 
         # A single WebSocket is opened after login and reused for every poll
         # and command until unload or failure. Beanbag does not reliably
@@ -262,7 +282,15 @@ class SecureControlsClient:
             _LOGGER.error("SecureControls: login ok but no devices (GD empty)")
             raise ApiError("Login ok but no devices (GD empty)")
 
-        gw = gd[0]
+        self.gateways = [g for g in gd if isinstance(g, dict)]
+        gw = next(
+            (
+                g
+                for g in self.gateways
+                if self.preferred_gmi and str(g.get("GMI")) == self.preferred_gmi
+            ),
+            gd[0],
+        )
         self.thermostat = Thermostat(
             gmi=str(gw["GMI"]),
             sn=str(gw["SN"]),
@@ -335,7 +363,14 @@ class SecureControlsClient:
             await self._close_websocket(websocket)
 
     # --------------- Transactional request/response ---------------
-    async def _send_request(self, *, hi: int, si: int, args: list[Any] | None = None) -> Any:
+    async def _send_request(
+        self,
+        *,
+        hi: int,
+        si: int,
+        args: list[Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
         if not self.thermostat:
             raise RuntimeError("No thermostat selected")
         if self._auth_rejected:
@@ -351,6 +386,8 @@ class SecureControlsClient:
                     "Beanbag authentication was rejected; reload the integration to sign in again"
                 )
 
+            if timeout is None:
+                timeout = WS_RESPONSE_TIMEOUT_SECS
             corr = self._new_corr()
             env: Json = {
                 "V": "1.0",
@@ -370,10 +407,18 @@ class SecureControlsClient:
 
             success = False
             try:
-                await websocket.send_json(env)
+                text = _compact_dumps(env)
+                if len(text.encode()) > MAX_REQUEST_BYTES:
+                    _LOGGER.warning(
+                        "SecureControls: request HI/SI=%s/%s is %s bytes; the device may ignore it",
+                        hi,
+                        si,
+                        len(text.encode()),
+                    )
+                await websocket.send_json(env, dumps=_compact_dumps)
                 _LOGGER.debug("SecureControls: sent request HI/SI=%s/%s corr=%s", hi, si, corr)
 
-                async with asyncio.timeout(WS_RESPONSE_TIMEOUT_SECS):
+                async with asyncio.timeout(timeout):
                     while True:
                         message = await websocket.receive()
                         if message.type == aiohttp.WSMsgType.TEXT:
@@ -418,7 +463,7 @@ class SecureControlsClient:
                             raise CannotConnect("WebSocket closed before the response arrived")
             except TimeoutError as err:
                 raise CannotConnect(
-                    f"WebSocket response timed out after {WS_RESPONSE_TIMEOUT_SECS} seconds"
+                    f"WebSocket response timed out after {timeout:g} seconds"
                 ) from err
             except aiohttp.ClientError as err:
                 raise CannotConnect(f"WebSocket request failed: {err}") from err
@@ -450,22 +495,49 @@ class SecureControlsClient:
         # 3/1 → returns blocks with items
         return await self._send_request(hi=3, si=1)
 
+    async def program_read(self, index: int) -> Any:
+        # 22/17 with [index] → weekly program; index = zone/channel number
+        return await self._send_request(hi=22, si=17, args=[int(index)])
+
+    async def program_write(self, index: int, entries: list[dict[str, int]]) -> Any:
+        """21/17 with [{"I": index, "D": [7 days x 6 {"O","T"}]}] → replace a weekly program."""
+        if len(entries) != 42:  # noqa: PLR2004
+            raise ValueError("A weekly program has exactly 42 switch points (7 x 6)")
+        return await self._send_request(
+            hi=21,
+            si=17,
+            args=[{"I": int(index), "D": [dict(e) for e in entries]}],
+            timeout=PROGRAM_WRITE_TIMEOUT_SECS,
+        )
+
     # --------------- Generic writer helper ---------------
-    async def _write_item(self, item_id: int, value: int, *, ot: int = 1, d: int = 0) -> Any:
+    async def _write_item(
+        self,
+        item_id: int,
+        value: int,
+        *,
+        ot: int = 1,
+        d: int = 0,
+        slot: int = THERMO_SLOT,
+        si: int = THERMO_SI,
+    ) -> Any:
         """
-        Write a single state item on SI:15 / slot 1.
+        Write a single state item on block SI (default 15) / slot (default 1).
         ot: 1=immediate set, 2=timed override (minutes in D)
+        Multi-zone programmers (H3747/C1727) use slot = zone/channel number.
         """
         return await self._send_request(
             hi=THERMO_HI_WRITE,
-            si=THERMO_SI,
-            args=[THERMO_SLOT, {"I": int(item_id), "V": int(value), "OT": int(ot), "D": int(d)}],
+            si=si,
+            args=[int(slot), {"I": int(item_id), "V": int(value), "OT": int(ot), "D": int(d)}],
         )
 
     # --------------- Writes (Thermostat SI:15, slot=1) ---------------
-    async def set_target_temp(self, celsius: float) -> Any:
+    async def set_target_temp(self, celsius: float, slot: int = THERMO_SLOT) -> Any:
         # I:1 target (deci °C), OT:1 immediate
-        return await self._write_item(ITEM_TARGET, self.c_to_deci(celsius), ot=1, d=0)
+        return await self._write_item(
+            ITEM_TARGET, self.c_to_deci(celsius), ot=1, d=0, slot=slot
+        )
 
     async def set_mode(self, on: bool) -> Any:
         """
@@ -498,6 +570,21 @@ class SecureControlsClient:
                 raise ValueError(f"Unsupported preset code {code} (expected 1 or 2)")
         return await self._write_item(ITEM_PRESET, code, ot=1, d=0)
 
-    async def set_timed_hold(self, celsius: float, minutes: int) -> Any:
+    async def set_timed_hold(self, celsius: float, minutes: int, slot: int = THERMO_SLOT) -> Any:
         # Timed override on target (I:1, OT:2) for D:<minutes>
-        return await self._write_item(ITEM_TARGET, self.c_to_deci(celsius), ot=2, d=int(minutes))
+        return await self._write_item(
+            ITEM_TARGET, self.c_to_deci(celsius), ot=2, d=int(minutes), slot=slot
+        )
+
+    # --------------- Writes (hot water, SI:16) ---------------
+    async def hot_water_boost(self, slot: int, minutes: int) -> Any:
+        """Boost a hot water channel for <minutes> (same command as the app's Boost)."""
+        if int(minutes) <= 0:
+            raise ValueError("Boost duration must be a positive number of minutes")
+        return await self._write_item(
+            ITEM_HW_BOOST, 0, ot=2, d=int(minutes), slot=slot, si=HOT_WATER_SI
+        )
+
+    async def hot_water_cancel_boost(self, slot: int) -> Any:
+        """Cancel an active hot water boost."""
+        return await self._write_item(ITEM_HW_BOOST, 0, ot=2, d=0, slot=slot, si=HOT_WATER_SI)

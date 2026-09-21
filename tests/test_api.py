@@ -49,8 +49,9 @@ class FakeWS:
         self.sent: list[Any] = []
         self.closed = False
 
-    async def send_json(self, payload: Any) -> None:
+    async def send_json(self, payload: Any, *, dumps=json.dumps) -> None:
         self.sent.append(payload)
+        self.sent_text = getattr(self, "sent_text", []) + [dumps(payload)]
 
     async def receive(self) -> _WSMsg:
         if self._receive_gate is not None:

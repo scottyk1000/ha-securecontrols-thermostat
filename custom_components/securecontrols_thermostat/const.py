@@ -1,6 +1,10 @@
 DOMAIN = "securecontrols_thermostat"
-PLATFORMS: list[str] = ["climate", "sensor"]
+PLATFORMS: list[str] = ["climate", "sensor", "switch", "binary_sensor", "calendar"]
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 UPDATE_INTERVAL_SECS = 45
 CONF_GATEWAY_GMI = "gateway_gmi"  # stored in entry.data; add to const.py if you prefer
+DEFAULT_BOOST_MINUTES = 60
+SERVICE_BOOST = "boost"
+SERVICE_GET_SCHEDULE = "get_schedule"
+SERVICE_SET_SCHEDULE = "set_schedule"

@@ -9,6 +9,8 @@ license = {text = "MIT"}
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# tools/ holds standalone scripts that must run on older Python (e.g. macOS system python3)
+extend-exclude = ["tools"]
 select = ["E","F","I","UP","B","BLE","SIM","PL","RUF"]
 ignore = ["PLR0913","PLR0912","PLR0915"]
 

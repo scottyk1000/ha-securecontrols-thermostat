@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, ClassVar
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
-    HVACMode,
-    HVACAction,
-    ClimateEntityFeature,
     PRESET_NONE,
+    ClimateEntityFeature,
+    HVACAction,
+    HVACMode,
 )
-from homeassistant.const import UnitOfTemperature, ATTR_TEMPERATURE
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 
-from .const import DOMAIN, CONF_GATEWAY_GMI
-from .coordinator import ThermoCoordinator
+from .const import CONF_GATEWAY_GMI, DOMAIN
+from .coordinator import KIND_HEATING, ThermoCoordinator
+from .entity import SecureZoneEntity, zone_slots
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -23,119 +22,107 @@ async def async_setup_entry(hass, entry, async_add_entities):
     coordinator: ThermoCoordinator = data["coordinator"]  # created in __init__.py
     gmi: str = entry.data[CONF_GATEWAY_GMI]
 
-    entity = SecureThermostatEntity(coordinator, client, gmi)
-    async_add_entities([entity], update_before_add=True)
+    async_add_entities(
+        SecureThermostatEntity(coordinator, client, gmi, slot)
+        for slot in zone_slots(coordinator, KIND_HEATING)
+    )
 
 
-class SecureThermostatEntity(CoordinatorEntity[ThermoCoordinator], ClimateEntity):
-    """Secure thermostat that is single-mode (heat only) and auto-activates heat when target > ambient."""
+class SecureThermostatEntity(SecureZoneEntity, ClimateEntity):
+    """One heating zone.
 
-    # writable: target temp + preset; hvac mode is NOT writable
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
-    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]  # single fixed mode
-    _attr_preset_modes = ["away", "home"]
+    Plain thermostats keep the original heat/off behaviour driven by item 3.
+    On multi-zone programmers item 3 does not reflect heat/off, so zones are
+    heat-only and simply follow their schedule unless the target is changed.
+    """
+
+    _attr_preset_modes: ClassVar[list[str]] = ["away", "home"]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = 5.0
     _attr_max_temp = 30.0
     _attr_target_temperature_step = 0.5
-    _attr_has_entity_name = True
-    _attr_name = "Thermostat"
+    _enable_turn_on_off_backwards_compatibility = False
 
-    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
-        super().__init__(coordinator)
-        self.client = client
-        self._gmi = gmi
-        self._attr_unique_id = f"{gmi}_climate"
+    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str, slot: int) -> None:
+        super().__init__(coordinator, client, gmi, slot, "climate")
+        # Zone devices are named after the zone, so the climate entity takes the device name.
+        self._attr_name = None if self._multi else "Thermostat"
+        # Away/home is reported (and settable) on the first zone only.
+        self._has_preset = self.zone.get("preset") is not None or not self._multi
+        features = ClimateEntityFeature.TARGET_TEMPERATURE
+        if self._has_preset:
+            features |= ClimateEntityFeature.PRESET_MODE
+        self._attr_supported_features = features
+        self._attr_hvac_modes = [HVACMode.HEAT] if self._multi else [HVACMode.HEAT, HVACMode.OFF]
 
-    # ---------- Device info ----------
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        ther = getattr(self.client, "thermostat", None)
-        model = "Thermostat"
-        name = "Secure Thermostat"
-        sn = None
-        hn = None
-        if ther:
-            sn = getattr(ther, "sn", None)
-            hn = getattr(ther, "hn", None)
-            name = hn or sn or name
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._gmi)},
-            manufacturer="Secure Meters",
-            model=model,
-            name=name,
-            serial_number=sn,
-        )
-
-    # ---------- State (read-only HVAC mode, derived HVAC action) ----------
+    # ---------- state ----------
 
     @property
     def hvac_mode(self) -> HVACMode:
-        s = self.coordinator.data or {}
-        hvac_val = s.get("hvac")
-        if hvac_val == 1:
+        if self._multi:
             return HVACMode.HEAT
-        else:
-            return HVACMode.OFF
-
+        return HVACMode.HEAT if self.zone.get("hvac") == 1 else HVACMode.OFF
 
     @property
     def hvac_action(self) -> HVACAction | None:
-        s = self.coordinator.data or {}
-        # coordinator exposes "hvac": 0 = idle, 1 = actively heating
-        hvac_val = s.get("hvac")
+        if self._multi:
+            return None  # the cloud does not report per-zone demand
+        hvac_val = self.zone.get("hvac")
         if hvac_val == 1:
             return HVACAction.HEATING
         if hvac_val == 0:
             return HVACAction.IDLE
-        return None  # unknown during startup
+        return None
 
     @property
-    def current_temperature(self) -> Optional[float]:
-        s = self.coordinator.data or {}
-        return s.get("ambient_c")
+    def current_temperature(self) -> float | None:
+        return self.zone.get("ambient_c")
 
     @property
-    def target_temperature(self) -> Optional[float]:
-        s = self.coordinator.data or {}
-        return s.get("target_c")
+    def target_temperature(self) -> float | None:
+        return self.zone.get("target_c")
 
     @property
-    def current_humidity(self) -> Optional[float]:
-        s = self.coordinator.data or {}
-        return s.get("humidity")
+    def current_humidity(self) -> float | None:
+        return self.zone.get("humidity")
 
     @property
-    def preset_mode(self) -> str:
-        s = self.coordinator.data or {}
-        # coordinator provides "preset": "away" | "home" | None
-        return s.get("preset") or PRESET_NONE
+    def preset_mode(self) -> str | None:
+        if not self._has_preset:
+            return None
+        return self.zone.get("preset") or PRESET_NONE
 
-    # ---------- Commands (no set_hvac_mode) ----------
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        z = self.zone
+        return {
+            "zone": self._slot,
+            "scheduled_temperature": z.get("scheduled_target_c"),
+            "next_target_temperature": z.get("next_target_c"),
+            "frost_protection_temperature": z.get("frost_c"),
+        }
+
+    # ---------- commands ----------
+
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set new target hvac mode."""
+        """Legacy single-thermostat behaviour; programmer zones are heat-only."""
+        if self._multi or self.current_temperature is None:
+            return
         if hvac_mode == HVACMode.HEAT:
-            await self.client.set_target_temp(self.current_temperature + 2.0)
+            await self._command(self.client.set_target_temp(self.current_temperature + 2.0))
         else:
-            await self.client.set_target_temp(self.current_temperature - 2.0)
+            await self._command(self.client.set_target_temp(self.current_temperature - 2.0))
+        await self.coordinator.async_request_refresh()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         if ATTR_TEMPERATURE in kwargs:
             target = float(kwargs[ATTR_TEMPERATURE])
-            await self.client.set_target_temp(target)
+            await self._command(self.client.set_target_temp(target, slot=self._slot))
             await self.coordinator.async_request_refresh()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Set the thermostat preset (away/home)."""
+        """Set the away/home preset."""
         if preset_mode not in self._attr_preset_modes:
             return
-        if preset_mode == PRESET_NONE:
-            # Treat "none" as normal/home (adjust if your API supports a real 'none')
-            await self.client.set_preset("home")
-        else:
-            await self.client.set_preset(preset_mode)
-        await self.coordinator.async_request_refresh()
-
-    async def async_update(self) -> None:
+        await self._command(self.client.set_preset(preset_mode))
         await self.coordinator.async_request_refresh()

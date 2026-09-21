@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-from datetime import timedelta, datetime
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any
 
 from homeassistant.components.sensor import (
-    SensorEntity,
     SensorDeviceClass,
+    SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfTemperature
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, CONF_GATEWAY_GMI
-from .coordinator import ThermoCoordinator
+from .const import CONF_GATEWAY_GMI, DOMAIN
+from .coordinator import KIND_HEATING, KIND_HOT_WATER, ThermoCoordinator
+from .entity import SecureZoneEntity, zone_slots
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -22,137 +21,104 @@ async def async_setup_entry(hass, entry, async_add_entities):
     data = hass.data[DOMAIN][entry.entry_id]
     client = data["client"]
     coordinator: ThermoCoordinator = data["coordinator"]
-    gmi: str = entry.data.get(CONF_GATEWAY_GMI) or getattr(getattr(client, "thermostat", None), "gmi", "unknown")
+    gmi: str = entry.data.get(CONF_GATEWAY_GMI) or getattr(
+        getattr(client, "thermostat", None), "gmi", "unknown"
+    )
 
-    entities: list[SensorEntity] = [
-        CurrentTempSensor(coordinator, client, gmi),
-        TargetTempSensor(coordinator, client, gmi),
-        NextChangeTimeSensor(coordinator, client, gmi),
-        NextTargetTempSensor(coordinator, client, gmi),
-    ]
-    async_add_entities(entities, update_before_add=True)
-
-
-class _BaseSecureSensor(CoordinatorEntity[ThermoCoordinator], SensorEntity):
-    """Shared bits for device info & identity."""
-
-    _attr_has_entity_name = True
-
-    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
-        super().__init__(coordinator)
-        self.client = client
-        self._gmi = gmi
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        ther = getattr(self.client, "thermostat", None)
-        model = "Thermostat"
-        name = "Secure Thermostat"
-        sn = None
-        hn = None
-        if ther:
-            sn = getattr(ther, "sn", None)
-            hn = getattr(ther, "hn", None)
-            name = hn or sn or name
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._gmi)},
-            manufacturer="Secure Meters",
-            model=model,
-            name=name,
-            serial_number=sn,
-        )
+    entities: list[SensorEntity] = []
+    for slot in zone_slots(coordinator, KIND_HEATING):
+        entities += [
+            CurrentTempSensor(coordinator, client, gmi, slot),
+            TargetTempSensor(coordinator, client, gmi, slot),
+            NextChangeTimeSensor(coordinator, client, gmi, slot),
+            NextTargetTempSensor(coordinator, client, gmi, slot),
+        ]
+        zone = (coordinator.data or {}).get("zones", {}).get(slot, {})
+        if zone.get("humidity") is not None:
+            entities.append(HumiditySensor(coordinator, client, gmi, slot))
+    for slot in zone_slots(coordinator, KIND_HOT_WATER):
+        entities.append(NextChangeTimeSensor(coordinator, client, gmi, slot))
+    async_add_entities(entities)
 
 
-class NextChangeTimeSensor(_BaseSecureSensor):
-    """Timestamp of the next scheduled change (now + next_change_mins)."""
+class _ZoneSensor(SecureZoneEntity, SensorEntity):
+    """Sensor for one zone; ``_field`` names the coordinator zone key."""
 
-    _attr_name = "Next Schedule Change"
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _field: str
+    _key: str
 
-    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
-        super().__init__(coordinator, client, gmi)
-        self._attr_unique_id = f"{gmi}_next_change"
+    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str, slot: int) -> None:
+        super().__init__(coordinator, client, gmi, slot, self._key)
 
     @property
-    def native_value(self) -> Optional[datetime]:
-        """Return an aware UTC datetime for the next change."""
-        s = self.coordinator.data or {}
-        mins = s.get("next_change_mins")
-        if mins is None:
-            return None
-        try:
-            return dt_util.utcnow() + timedelta(minutes=int(mins))
-        except Exception:
-            return None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        s = self.coordinator.data or {}
-        return {
-            "next_change_mins": s.get("next_change_mins"),
-            "next_target_c": s.get("next_target_c"),
-        }
+    def native_value(self) -> Any:
+        return self.zone.get(self._field)
 
 
-class CurrentTempSensor(_BaseSecureSensor):
-    """Current measured ambient temperature (degC)."""
+class CurrentTempSensor(_ZoneSensor):
+    """Current measured ambient temperature (°C)."""
 
     _attr_name = "Current Temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
-        super().__init__(coordinator, client, gmi)
-        self._attr_unique_id = f"{gmi}_current_temp_c"
-
-    @property
-    def native_value(self) -> Optional[float]:
-        s = self.coordinator.data or {}
-        val = s.get("ambient_c")
-        return None if val is None else float(val)
+    _field = "ambient_c"
+    _key = "current_temp_c"
 
 
-class TargetTempSensor(_BaseSecureSensor):
-    """Current active target temperature (degC)."""
+class TargetTempSensor(_ZoneSensor):
+    """Current active target temperature (°C)."""
 
     _attr_name = "Target Temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
-        super().__init__(coordinator, client, gmi)
-        self._attr_unique_id = f"{gmi}_target_temp_c"
-
-    @property
-    def native_value(self) -> Optional[float]:
-        s = self.coordinator.data or {}
-        val = s.get("target_c")
-        return None if val is None else float(val)
+    _field = "target_c"
+    _key = "target_temp_c"
 
 
-class NextTargetTempSensor(_BaseSecureSensor):
+class NextTargetTempSensor(_ZoneSensor):
     """The next scheduled target temperature (°C)."""
 
     _attr_name = "Next Target Temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _field = "next_target_c"
+    _key = "next_target_c"
 
-    def __init__(self, coordinator: ThermoCoordinator, client, gmi: str) -> None:
-        super().__init__(coordinator, client, gmi)
-        self._attr_unique_id = f"{gmi}_next_target_c"
+
+class HumiditySensor(_ZoneSensor):
+    """Relative humidity from the zone's display/sensor, where fitted."""
+
+    _attr_name = "Humidity"
+    _attr_device_class = SensorDeviceClass.HUMIDITY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _field = "humidity"
+    _key = "humidity"
+
+
+class NextChangeTimeSensor(_ZoneSensor):
+    """When the zone's schedule next changes (for hot water: also when a boost ends).
+
+    The device reports this as minutes since local midnight.
+    """
+
+    _attr_name = "Next Schedule Change"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _field = "next_change_mins"
+    _key = "next_change"
 
     @property
-    def native_value(self) -> Optional[float]:
-        s = self.coordinator.data or {}
-        val = s.get("next_target_c")
-        return None if val is None else float(val)
+    def native_value(self) -> datetime | None:
+        return ThermoCoordinator.minute_of_day_to_datetime(
+            self.zone.get("next_change_mins"), dt_util.now()
+        )
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        s = self.coordinator.data or {}
-        return {
-            "next_change_mins": s.get("next_change_mins"),
-        }
+        z = self.zone
+        if z.get("kind") == KIND_HOT_WATER:
+            return {"next_state": "on" if z.get("next_state_on") else "off"}
+        return {"next_target_c": z.get("next_target_c")}
